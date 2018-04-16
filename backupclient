@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+
+# Répertoire de configuration
+C_confdir='/etc/backupclient'
+C_conffile='backup.conf'
+C_projectsdir='enabled'
+
+C_mainconf="$C_confdir/$C_conffile"
+C_projects="$C_confdir/$C_projectsdir"
+
+#-------------------#
+# GESTION DES DATES #
+#-------------------#
+# Dernier jour du mois
+get_eom() {
+	local y=$1
+	local m=$2
+	local a=$(( 30+(m+m/8)%2 ))
+	(( m==2 )) && (( a -= 2 ))
+	(( m==2 && y%4==0 && (y%100>0 || y%400==0) )) && (( a += 1 ))
+	printf '%d' $a
+}
+
+# Formatage de la date pour le log
+logdate() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# Formatage de la date pour le nom de fichier
+filedate() { date '+%Y-%m-%d_%Hh%Mm'; }
+
+# Récupère le timestamp à partir d’une date
+timestamp() {
+	local d
+	if (( $#==0 )); then
+		d='now'
+	else
+		d="$1"
+		(( $# > 1 )) && d="$d $2 ago"
+	fi
+	date -d "$d" '+%s'
+}
+
+# Extraire la date d’un nom de fichier
+extract_date() {
+	local f="$1"
+	local t=${f%_*}
+	local h=${f##*_}
+	t=${t##*_}
+	h=${h%%.*}
+	h="${h:0:2}:${h:3:2}"
+	echo "${t}T${h}"
+}
+
+# Format de date pour le timestamp du touch
+touchdate() {
+	local d="$1"
+	d="${d:0:4}${d:5:2}${d:8:2}${d:11:2}${d:14:2}"
+	echo "$d"
+}
+
+# Récupère la date de la dernière sauvegarde complète
+last_complete() {
+	if [[ -r .complete ]]; then
+		local d=( $(cat .complete) )
+		local e=$(extract_date $d)
+		if timestamp $e > /dev/null 2> /dev/null; then
+			echo $d
+			return 0
+		fi
+	fi
+	return 1
+}
+
+#------------------#
+# GESTION DES LOGS #
+#------------------#
+# Formatage d’une ligne de log
+message() { printf "%-20s%-10s%s\n" "$(logdate)" "$1" "$2" >> "$C_logfile"; }
+
+# Message d’erreur
+error() { message "$C_error" "$1"; }
+
+# Message d’alerte
+warning() { message "$C_warning" "$1"; }
+
+# Message d’information
+notice() { message "$C_notice" "$1"; }
+
+# Récupération du message à partir d’une commande externe
+logecho() {
+	local e="$1"
+	local t="$C_notice"
+	local m="${e:3}"
+	case "${e:0:3}" in
+	'#n#') t="$C_notice";;
+	'#w#') t="$C_warning";;
+	'#e#') t="$C_error";;
+	*)     m="$e"
+	esac
+	message "$t" "$m"
+}
+
+# Lancement
+init_log() {
+	echo "----------------------" >> "$C_logfile"
+	notice "DÉBUT DE LA SAUVEGARDE"
+}
+
+# Fin
+end_log() {
+	notice "FIN DE LA SAUVEGARDE"
+	echo "----------------------" >> "$C_logfile"
+	exit $1
+}
+
+#--------------------------#
+# INITIALISATION DU BACKUP #
+#--------------------------#
+# Initialisation du fichier de conf principal
+init_main() {
+	source "$C_mainconf" 2> /dev/null
+	(( $? )) && error "Impossible de lire la configuration de $C_mainconf" && return 1
+	return 0
+}
+
+# Initialisation des variables
+init_vars() {
+	local pconf="$1"
+	source "$C_mainconf" 2> /dev/null
+	source "$pconf" 2> /dev/null
+	(( $? )) && error "Impossible de lire la configuration de $pconf" && return 1
+
+	! (( $D_save )) && ! (( $M_save )) && return 1
+
+	[[ -z "$C_backupdir" ]] && error "Le répertoire de sauvegarde n'est pas défini" && return 1
+	[[ -z "$C_projectname" ]] && error "Le nom du projet n'est pas défini" && return 1
+	if [[ -z "$C_daily" ]] || [[ -z "$C_weekly" ]] || [[ -z "$C_monthly" ]]; then
+		error "Les répertoires journalier/hebdo/mensuel ne sont pas définis" && return 1
+	fi
+	if [[ -z "$D_host" ]] || [[ -z "$D_user" ]] || [[ -z "$D_port" ]]; then
+		error "Les paramètres SSH du serveur à sauvegarder ne sont pas définis" && return 1
+	fi
+	if (( $D_save )) && [[ -z "$D_destdir" ]]; then
+		error "Le dossier de destination de backup des fichiers n'est pas défini" && return 1
+	fi
+	if (( $M_save )); then
+		if [[ -z $M_host ]] || [[ -z $M_user ]] || [[ -z $M_pass ]] || [[ -z $M_port ]]; then
+			error "Les paramètres de connexion mysql ne sont pas défini" && return 1
+		fi
+		[[ -z "$M_destdir" ]] && error "Le dossier de destination de backup des BDD n'est pas défini" && return 1
+	fi
+
+	if [[ ! -d "$C_backupdir/$C_projectname" ]]; then
+		mkdir -p "$C_backupdir/$C_projectname" 2> /dev/null
+		(( $? )) && error "Impossible de créer le répertoire de sauvegarde $C_backupdir/$C_projectname" && return 1
+	fi
+	if (( $D_save )); then
+		local ddir="$C_backupdir/$C_projectname/$D_destdir"
+		mkdir -p "$ddir"/{"$C_daily","$C_weekly","$C_monthly"} 2> /dev/null
+		if [[ ! -d "$ddir/$C_daily" ]] ||[[ ! -d "$ddir/$C_weekly" ]] || [[ ! -d "$ddir/$C_monthly" ]]; then
+			error "Impossible de créer les répertoires de destination de backup des fichiers" && return 1
+		fi
+	fi
+	if (( $M_save )); then
+		local mdir="$C_backupdir/$C_projectname/$M_destdir"
+		mkdir -p "$mdir"/{"$C_daily","$C_weekly","$C_monthly"} 2> /dev/null
+		if [[ ! -d "$mdir/$C_daily" ]] ||[[ ! -d "$mdir/$C_weekly" ]] || [[ ! -d "$mdir/$C_monthly" ]]; then
+			error "Impossible de créer les répertoires de destination de backup des fichiers" && return 1
+		fi
+	fi
+}
+
+#------------#
+# SAUVEGARDE #
+#------------#
+# Dump et récupération de la BDD donnée en argument
+dump_sql() {
+	local bdd="$1"
+	local f="${bdd}_$(filedate).sql"
+	local c1="mysqldump --user=${M_user} --password=${M_pass} --host=${M_host} --port=${M_port} --databases ${bdd} > '/tmp/$f'
+	if (( \$? )); then
+		echo '#e#Impossible de faire un dump de $bdd'
+		rm -f '/tmp/$f' 2> /dev/null
+	else
+		echo '#n#$bdd dumpée dans le fichier distant /tmp/$f'
+	fi
+	exit 0"
+	local c2="rm -f '/tmp/$f'; exit 0"
+	local msg=$(ssh -p $D_port "$D_user"@"$D_host" "$c1" 2> /dev/null)
+	if (( $? )); then
+		error 'Impossible de se connecter en SSH'
+		return 1
+	fi
+	mapfile -t msg <<< "$msg"
+	local m
+	for m in "${msg[@]}"; do
+		logecho "$m"
+	done
+	if scp -P ${D_port} "$D_user"@"$D_host":"/tmp/$f" "${bdd}.sql" 2> /dev/null > /dev/null; then
+		notice "Dump $f récupéré"
+	else
+		error "Récupération du dump $f impossible"
+	fi
+	ssh -p $D_port "$D_user"@"$D_host" "$c2" > /dev/null 2> /dev/null
+}
+
+backup_sql() {
+	if [ ${#M_bdd[@]} -eq 0 ]; then
+		warning "Aucune base à sauvegarder"; return 1
+	fi
+	local sqldir="$C_backupdir/$C_projectname/$M_destdir"
+	case "$C_type" in
+	'd') sqldir="$sqldir/$C_daily";;
+	'w') sqldir="$sqldir/$C_weekly";;
+	'm') sqldir="$sqldir/$C_monthly";;
+	esac
+	mkdir "$sqldir/$C_projectname"
+	cd "$sqldir/$C_projectname"
+	local bdd
+	for bdd in "${M_bdd[@]}"; do
+		dump_sql "$bdd"
+	done
+	cd "$sqldir"
+	local f="${C_projectname}_$(filedate).tar.gz"
+	if (( $(ls -A "$sqldir/$C_projectname" | wc -l) )); then
+		tar czf "$f" "$C_projectname"
+		notice "BDD archivées dans le fichier $sqldir/$f"
+	else
+		warning "Aucune BDD à archiver"
+	fi
+	rm -rf "$sqldir/$C_projectname" 2> /dev/null
+	if [[ -f "$f" ]]; then
+		local tc=$(extract_date "$f")
+		local r
+		case "$C_type" in
+		'd') r="$M_rotd days";;
+		'w') r="$M_rotw weeks";;
+		'm') r="$M_rotm months";;
+		esac
+		tc=$(timestamp "$sc" "$r")
+		local ff
+		for ff in *.tar.gz; do
+			local t=$(extract_date "$ff")
+			t=$(timestamp "$t")
+			if (( ($tc-$t) > 86400 )); then
+				if rm -f "$ff" 2> /dev/null; then
+					notice "Suppression de l'archive $sqldir/$ff"
+				else
+					error "Échec de suppression de l'archive $sqldir/$ff"
+				fi
+			fi
+		done
+	fi
+}
+
+backup_data() {
+	if [ ${#D_srcdir[@]} -eq 0 ]; then
+		warning "Aucun fichier à sauvegarder"; return 1
+	fi
+	local datadir="$C_backupdir/$C_projectname/$D_destdir"
+	local c=0
+	case "$C_type" in
+	'd') datadir="$datadir/$C_daily";;
+	'w') datadir="$datadir/$C_weekly";;
+	'm') datadir="$datadir/$C_monthly"; c=1;;
+	esac
+	cd "$datadir"
+	local d="$(filedate)"
+	local dc
+	if [[ "$C_type" != 'm' ]]; then
+		if dc="$(last_complete)"; then
+			local r
+			if [[ "$C_type" = 'w' ]]; then
+				r=$(( D_rotw*7 ))
+			else
+				r=$D_rotd
+			fi
+			local t=$(timestamp $(extract_date $d) "$r days")
+			local tc=$(timestamp $(extract_date $dc))
+			if (( ($t-$tc) >= 0 )); then
+				unset dc
+				c=1
+			fi
+		else
+			c=1
+		fi
+	fi
+	local cmd
+	local f="${C_projectname}_${d}"
+	local tf="/tmp/date_backup_${d}"
+	if (( $c )); then
+		f="${f}.tar.gz"
+		cmd="tar cz ${D_srcdir[@]} | cat"
+	else
+		f="${f}.diff.tar.gz"
+		cmd="touch -t $(touchdate $dc) $tf; find ${D_srcdir[@]} -newer $tf -print | tar cz -T - | cat"
+	fi
+
+	ssh -p $D_port "$D_user"@"$D_host" "$cmd" > "$f" 2> /dev/null
+	if (( $? )); then
+		error "Sauvegarde des fichiers dans l'archive $datadir/$f échouée"
+	else
+		notice "Sauvegarde des fichiers effectuée dans l'archive $datadir/$f"
+		(( $c )) && echo "$d" > .complete
+	fi	
+	(( $c )) || ssh -p $D_port "$D_user"@"$D_host" "rm -f $tf" 2> /dev/null
+	if [[ -f "$f" ]]; then
+		local t=$(extract_date "$f")
+		local r
+		local rc
+		case "$C_type" in
+		'd') r="$D_rotd days"; rc="$(( D_rotd * 2 )) days";;
+		'w') r="$D_rotw weeks"; rc="$(( D_rotw * 2 )) weeks";;
+		'm') r="$D_rotm months"; rc="$r";;
+		esac
+		local tc=$(timestamp "$t" "$rc")
+		t=$(timestamp "$t" "$r")
+		for ff in *.tar.gz; do
+			local tf=$(extract_date "$ff")
+			tf=$(timestamp "$tf")
+			case "$ff" in
+			*diff.tar.gz) tf=$(( t - tf ));;
+			*) tf=$(( tc - tf ));;
+			esac
+			if (( $tf > 86400 )); then
+				if rm -f "$ff"; then
+					notice "Suppression de l'archive $datadir/$ff"
+				else
+					error "Échec de suppression de l'archive $datadir/$ff"
+				fi
+			fi
+		done
+	fi
+}
+
+#===============================================================
+# Initialisation de la config principale
+source "$C_mainconf" 2>/dev/null
+init_log
+init_main || end_log 1
+
+if [[ ! -d "$C_projects" ]] || (( $(ls -A "$C_projects" | wc -l) == 0 )); then
+	warning "Aucun projet à sauvegarder"
+	end_log
+fi
+
+# Analyse des arguments
+C_type='d'
+if (( $# )); then
+	case $1 in
+	'-d') C_type='d';;
+	'-w') C_type='w';;
+	'-m') C_type='m';;
+	*) echo "Argument inconnu: $1" >&2; end_log 1;;
+	esac 
+fi
+
+for p in "$C_projects"/*; do
+	if init_vars "$p"; then
+		notice "Début de la sauvegarde du projet $C_projectname"
+		(( $M_save )) && backup_sql
+		(( $D_save )) && backup_data
+		notice "Fin de la sauvegarde du projet $C_projectname"
+	fi
+done
+
+end_log
